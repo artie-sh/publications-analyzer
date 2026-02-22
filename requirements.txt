@@ -1,0 +1,5 @@
+playwright>=1.58.0
+pymupdf>=1.24.0
+pytesseract>=0.3.10
+Pillow>=10.0.0
+tqdm>=4.66.0
