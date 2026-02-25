@@ -4,3 +4,5 @@
 *.zip
 *.pdf
 .idea/
+create_links.ps1
+*/__pycache__

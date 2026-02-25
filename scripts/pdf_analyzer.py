@@ -9,8 +9,8 @@ Output: output/<Species_name>/Author_Year_Paper_Title/
             images/page<N>_img<N>.png
 
 Dependencies:
-    pip install pymupdf pytesseract pillow tqdm
-    system: tesseract-ocr  (apt install tesseract-ocr)
+    pip install pymupdf pytesseract pillow tqdm langdetect
+    system: tesseract-ocr tesseract-ocr-rus  (apt install tesseract-ocr tesseract-ocr-rus)
 """
 
 import csv
@@ -25,6 +25,7 @@ import fitz  # pymupdf
 import pytesseract
 from PIL import Image
 from tqdm import tqdm
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -66,7 +67,7 @@ def parse_filename(stem: str) -> dict[str, str]:
       - Title follows immediately after the year token
 
     Strategy: find the first underscore-delimited token that looks like a year
-    (^\d{4}[a-z]?$).  Everything to its left is the author string; everything
+    (^\\d{4}[a-z]?$).  Everything to its left is the author string; everything
     to its right is the title (underscores replaced with spaces).
     """
     # Match the first year-like token.
@@ -98,9 +99,16 @@ def looks_garbled(text: str) -> bool:
     """
     Return True if text looks like a font-encoding artifact rather than real content.
 
-    PDFs with missing or broken ToUnicode maps produce raw glyph codes: the page
-    has plenty of characters, but they are mostly symbols/digits with very few
-    actual letters.
+    Catches two known artifact patterns:
+
+    1. Low alpha ratio — PDFs with missing/broken ToUnicode maps produce raw glyph
+       codes: many symbols and digits, very few letters.
+
+    2. Digits embedded inside letter sequences — some older PDFs (typically Soviet-era
+       Russian publications) use a custom glyph encoding where Cyrillic characters are
+       stored as visually-similar Latin codepoints, while Cyrillic digits (З→'3', б→'6',
+       etc.) land inside words: e.g. "H3yqaJIHCb" (Изучались), "pa6oTa" (работа).
+       In authentic text this pattern is negligible; a rate above 0.5 % flags corruption.
 
     Exception: if a meaningful share of non-whitespace characters are non-ASCII
     letters (Cyrillic, Greek, etc.), the page is real multilingual text and must
@@ -114,7 +122,14 @@ def looks_garbled(text: str) -> bool:
     if non_ascii_alpha / len(non_ws) >= 0.15:
         return False  # substantial non-Latin script content → real text
     alpha_count = sum(1 for c in non_ws if c.isalpha())
-    return (alpha_count / len(non_ws)) < MIN_ALPHA_RATIO
+    if (alpha_count / len(non_ws)) < MIN_ALPHA_RATIO:
+        return True
+    # Detect garbled Cyrillic-as-Latin: count digits that sit between two letters.
+    digits_in_word = sum(
+        1 for i in range(1, len(text) - 1)
+        if text[i].isdigit() and text[i - 1].isalpha() and text[i + 1].isalpha()
+    )
+    return digits_in_word / len(non_ws) > 0.005
 
 
 def page_to_pil(page: fitz.Page, dpi: int = OCR_DPI) -> Image.Image:

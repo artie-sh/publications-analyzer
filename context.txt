@@ -1,0 +1,67 @@
+# Project: Arachnology RAG Knowledge Base
+
+## Goal
+Build a knowledge base from scientific PDF publications about spiders, to be used with
+a Retrieval-Augmented Generation (RAG) system. The project was started to help a
+biologist friend process arachnology literature.
+
+## Directory Layout
+  downloads/                  - original download destination; PDFs organised by species
+      <Species_name>/             subdirectory. A paper covering multiple species appears
+          Author_Year_Title.pdf   in each relevant species folder, so files are duplicated.
+  pardosa/                    - deduplicated version of downloads/; one canonical copy of
+      <Species_name>/             each PDF is kept, duplicate copies replaced with symlinks,
+          Author_Year_Title.pdf   so the per-species folder structure is preserved.
+  exp_clean/                  - small hand-picked subset of pardosa/ used for iterating on
+      <Species_name>/             scripts without processing the full corpus.
+          Author_Year_Title.pdf
+  exp_clean_processed/        - output of pdf_analyzer.py run against exp_clean/ (experiment
+      <Species_name>/             results only; not the final production output).
+          Author_Year_Title/
+              text.txt        - full extracted text (plain text, UTF-8)
+              metadata.json   - author, year, title, page count, image count, ocr_used
+              images/         - extracted embedded images (page<N>_img<N>.png)
+      extraction_log.csv      - per-PDF summary row
+  scripts/
+      pdf_analyzer.py         - PDF → text + images (step 1, see below)
+      duplicates_remover.py   - replaces duplicate PDFs in downloads/ with symlinks → pardosa/
+      duplicates_analyzer.py  - analyses duplication across species folders
+      web_scraper.py          - downloaded PDFs from the online source
+  requirements.txt
+
+## Pipeline (planned)
+  Step 1 — PDF extraction    [DONE]   scripts/pdf_analyzer.py
+  Step 2 — Chunking                   split text.txt into overlapping chunks
+  Step 3 — Embedding                  embed chunks with a vector model
+  Step 4 — Vector store               store embeddings + metadata in a DB (e.g. ChromaDB)
+  Step 5 — RAG query layer            retrieve chunks + pass to LLM for answers
+
+## Step 1 Details — pdf_analyzer.py
+Reads every PDF under exp_clean/, per page:
+  - Tries native text extraction (PyMuPDF / fitz)
+  - Falls back to Tesseract OCR (eng+rus) if the page is:
+      * too short (< 50 non-whitespace chars)
+      * looks garbled (low alpha ratio, no substantial non-Latin script)
+      * text_is_readable() returns False (langdetect confidence < 0.80)
+  - Extracts embedded images (≥ 50×50 px) to images/
+
+## Current State & Results (as of 2026-02-25)
+First run processed 5 PDFs in exp_clean/Pardosa_abagensis/:
+  Denis_J_1964a        — 35 pages, 67 176 chars, 35 images,  ocr_used=True
+  Ovtsharenko_V_I_1979 — 18 pages, 47 679 chars, 18 images,  ocr_used=True  ← see bug below
+  Roewer_C_F_1959b     — 519 pages, 1 094 369 chars, 519 images, ocr_used=True
+  Simon_E_1883         — 58 pages,  108 122 chars, 116 images, ocr_used=False
+  Wunderlich_J_1992a   — 316 pages, 1 352 189 chars, 1436 images, ocr_used=True
+
+Bug found & fixed (2026-02-25):
+  Ovtsharenko_V_I_1979 is a Russian paper whose PDF stores Cyrillic glyphs via a
+  custom font encoding that maps them to Latin Unicode codepoints. PyMuPDF extracts
+  them as Latin characters (e.g. "H3yqaJIHCb" instead of "Изучались"). Alpha ratio
+  was high enough to pass looks_garbled(), and langdetect was unreliable (with enough
+  text it confidently but wrongly labelled the garbled content as "English").
+  Fix: added a digit-in-word check to looks_garbled() — Cyrillic digits like З→'3',
+  б→'6' land inside letter sequences (e.g. "H3y", "pa6oTa"), which never happens in
+  real text. A rate > 0.5% of non-ws chars triggers garbled detection → OCR fallback.
+  Removed the unreliable text_is_readable()/langdetect layer entirely.
+  Also fixed SyntaxWarning for \d in a docstring (escaped to \\d).
+  Action needed: re-run pdf_analyzer.py so Ovtsharenko is re-extracted with OCR.
