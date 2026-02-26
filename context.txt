@@ -44,6 +44,9 @@ Reads every PDF under exp_clean/, per page:
       * looks garbled (low alpha ratio, no substantial non-Latin script)
       * text_is_readable() returns False (langdetect confidence < 0.80)
   - Extracts embedded images (≥ 50×50 px) to images/
+      * Skips full-page background scans (image covers ≥85% of page — already OCR'd)
+      * Uses fitz.Pixmap (not extract_image) so PDF Decode arrays are applied → correct colours
+      * Converts CMYK and other non-RGB/Gray colourspaces to RGB before saving
 
 ## Current State & Results (as of 2026-02-25)
 First run processed 5 PDFs in exp_clean/Pardosa_abagensis/:

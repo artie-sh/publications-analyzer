@@ -184,6 +184,11 @@ def extract_pdf(pdf_path: Path, out_dir: Path) -> dict:
             else:
                 text_parts.append(f"[Page {label}]\n{raw_text}")
 
+            # Number of non-whitespace characters extracted for this page.
+            # Used below to decide whether a full-page scan is a text page
+            # (skip) or a figure plate (keep).
+            page_text_nws = nonws_len(text_parts[-1])
+
             # ------------------------------------------------------------------
             # Image extraction
             # ------------------------------------------------------------------
@@ -197,21 +202,54 @@ def extract_pdf(pdf_path: Path, out_dir: Path) -> dict:
                 seen_xrefs.add(xref)
 
                 try:
-                    base = doc.extract_image(xref)
-                    raw_bytes = base["image"]
+                    # Use fitz.Pixmap so MuPDF applies the PDF Decode array
+                    # (fixes inverted colours) and all colour-space transforms.
+                    pix = fitz.Pixmap(doc, xref)
 
-                    pil_img = Image.open(io.BytesIO(raw_bytes))
-                    w, h = pil_img.size
-                    if w < MIN_IMG_WIDTH or h < MIN_IMG_HEIGHT:
+                    if pix.width < MIN_IMG_WIDTH or pix.height < MIN_IMG_HEIGHT:
                         continue  # likely an icon or artifact
+
+                    # Skip full-page background scans, but only when the page
+                    # also has substantial text.  Pages with little text (≤ 300
+                    # non-ws chars) are figure plates and must be kept even when
+                    # the image fills the whole page.
+                    rects = page.get_image_rects(xref)
+                    if rects:
+                        r = rects[0]
+                        if (r.width  >= page.rect.width  * 0.85 and
+                                r.height >= page.rect.height * 0.85 and
+                                page_text_nws > 300):
+                            continue
+
+                    # Normalise to a saveable image.
+                    if pix.colorspace is None:
+                        # 1-bit /ImageMask: MuPDF exposes it as an alpha-only
+                        # Pixmap (255 = ink/opaque, 0 = paper/transparent).
+                        # Invert to produce a white-background grayscale image.
+                        pil_img = Image.frombytes(
+                            "L", (pix.width, pix.height), bytes(pix.samples)
+                        ).point(lambda x: 255 - x)
+                    else:
+                        # Convert all non-RGB colourspaces (DeviceGray, CMYK,
+                        # Separation, ICCBased, etc.) to sRGB.  This correctly
+                        # handles Separation(Black) where raw values are ink
+                        # amounts (0 = no ink = white), not grayscale luminance.
+                        if pix.colorspace != fitz.csRGB:
+                            pix = fitz.Pixmap(fitz.csRGB, pix)
+                        if pix.alpha:
+                            pix = fitz.Pixmap(pix, 0)
+                        pil_img = None
 
                     img_index += 1
                     if not images_dir_created:
                         images_dir.mkdir(exist_ok=True)
                         images_dir_created = True
 
-                    out_name = f"page{label}_img{img_index}.png"
-                    pil_img.save(images_dir / out_name, "PNG")
+                    out_path = images_dir / f"page{label}_img{img_index}.png"
+                    if pil_img is not None:
+                        pil_img.save(out_path, "PNG")
+                    else:
+                        pix.save(out_path)
                     image_count += 1
 
                 except Exception:
