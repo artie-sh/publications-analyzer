@@ -4,3 +4,5 @@ pytesseract>=0.3.10
 Pillow>=10.0.0
 tqdm>=4.66.0
 langdetect>=1.0.9
+docling>=2.75.0
+rapidfuzz>=3.0.0
