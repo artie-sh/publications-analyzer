@@ -6,3 +6,4 @@
 .idea/
 create_links.ps1
 */__pycache__
+/pardosa_parsed

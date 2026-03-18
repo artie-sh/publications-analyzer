@@ -15,56 +15,154 @@ biologist friend process arachnology literature.
   exp_clean/                  - small hand-picked subset of pardosa/ used for iterating on
       <Species_name>/             scripts without processing the full corpus.
           Author_Year_Title.pdf
-  exp_clean_processed/        - output of pdf_analyzer.py run against exp_clean/ (experiment
-      <Species_name>/             results only; not the final production output).
+  exp_clean_processed/        - output of pdf_processor.py (primary pipeline output)
+      <Species_name>/
           Author_Year_Title/
-              text.txt        - full extracted text (plain text, UTF-8)
-              metadata.json   - author, year, title, page count, image count, ocr_used
-              images/         - extracted embedded images (page<N>_img<N>.png)
-      extraction_log.csv      - per-PDF summary row
+              document.json   - full Docling document model (structure, bboxes, provenance)
+              chunks.json     - RAG-ready chunks with text, headings, page numbers,
+                                figure refs, table refs (post-processed, max 400 tokens)
+              run.log         - stdout mirror for this PDF's processing run
+              tables/
+                  <slug>.csv          - table data
+                  <slug>.png          - table region image
+                  <slug>_meta.json    - caption, page_number, rows, cols, image_file,
+                                        source_file, species
+              images/
+                  <slug>.png          - figure image
+                  <slug>_meta.json    - caption, page_number, picture_ref, source_file,
+                                        species, image_quality (width_px, height_px,
+                                        megapixels, mode, is_color, sharpness, contrast)
   scripts/
-      pdf_analyzer.py         - PDF → text + images (step 1, see below)
+      pdf_processor.py        - primary pipeline: Docling extraction → tables → figures
+                                → chunks → post-processing (step 1, see below)
+      pdf_analyzer.py         - legacy PyMuPDF + Tesseract script; looks_garbled() helper
+                                is still imported by pdf_processor.py for its pre-check
+      fix_chunk_figures.py    - standalone post-processing script (superseded; logic
+                                fully integrated into pdf_processor.py — kept for reference)
       duplicates_remover.py   - replaces duplicate PDFs in downloads/ with symlinks → pardosa/
       duplicates_analyzer.py  - analyses duplication across species folders
       web_scraper.py          - downloaded PDFs from the online source
   requirements.txt
 
-## Pipeline (planned)
-  Step 1 — PDF extraction    [DONE]   scripts/pdf_analyzer.py
-  Step 2 — Chunking                   split text.txt into overlapping chunks
-  Step 3 — Embedding                  embed chunks with a vector model
-  Step 4 — Vector store               store embeddings + metadata in a DB (e.g. ChromaDB)
-  Step 5 — RAG query layer            retrieve chunks + pass to LLM for answers
+## Pipeline
+  Step 1 — PDF extraction    [DONE]   scripts/pdf_processor.py
+                                        (replaces earlier pdf_analyzer.py approach)
+  Step 2 — Chunking          [DONE]   integrated into pdf_processor.py via HybridChunker;
+                                        chunks written to chunks.json per PDF
+  Step 3 — Embedding                   embed chunk texts with a vector model
+  Step 4 — Vector store                store embeddings + metadata in a DB (e.g. ChromaDB)
+  Step 5 — RAG query layer             retrieve chunks + pass to LLM for answers
 
-## Step 1 Details — pdf_analyzer.py
-Reads every PDF under exp_clean/, per page:
-  - Tries native text extraction (PyMuPDF / fitz)
-  - Falls back to Tesseract OCR (eng+rus) if the page is:
-      * too short (< 50 non-whitespace chars)
-      * looks garbled (low alpha ratio, no substantial non-Latin script)
-      * text_is_readable() returns False (langdetect confidence < 0.80)
-  - Extracts embedded images (≥ 50×50 px) to images/
-      * Skips full-page background scans (image covers ≥85% of page — already OCR'd)
-      * Uses fitz.Pixmap (not extract_image) so PDF Decode arrays are applied → correct colours
-      * Converts CMYK and other non-RGB/Gray colourspaces to RGB before saving
+## Step 1 Details — pdf_processor.py
+Primary script. Processes each PDF through a multi-stage pipeline:
 
-## Current State & Results (as of 2026-02-25)
-First run processed 5 PDFs in exp_clean/Pardosa_abagensis/:
-  Denis_J_1964a        — 35 pages, 67 176 chars, 35 images,  ocr_used=True
-  Ovtsharenko_V_I_1979 — 18 pages, 47 679 chars, 18 images,  ocr_used=True  ← see bug below
-  Roewer_C_F_1959b     — 519 pages, 1 094 369 chars, 519 images, ocr_used=True
-  Simon_E_1883         — 58 pages,  108 122 chars, 116 images, ocr_used=False
-  Wunderlich_J_1992a   — 316 pages, 1 352 189 chars, 1436 images, ocr_used=True
+### Pre-check (garbled text detection)
+  Uses pdf_analyzer.looks_garbled() via PyMuPDF (fitz) to scan every page before Docling
+  conversion. If > 30% of text-bearing pages are garbled (font-encoding artifacts, typically
+  Soviet-era Russian papers with Cyrillic stored as Latin codepoints), forces full-page OCR.
 
-Bug found & fixed (2026-02-25):
-  Ovtsharenko_V_I_1979 is a Russian paper whose PDF stores Cyrillic glyphs via a
-  custom font encoding that maps them to Latin Unicode codepoints. PyMuPDF extracts
-  them as Latin characters (e.g. "H3yqaJIHCb" instead of "Изучались"). Alpha ratio
-  was high enough to pass looks_garbled(), and langdetect was unreliable (with enough
-  text it confidently but wrongly labelled the garbled content as "English").
-  Fix: added a digit-in-word check to looks_garbled() — Cyrillic digits like З→'3',
-  б→'6' land inside letter sequences (e.g. "H3y", "pa6oTa"), which never happens in
-  real text. A rate > 0.5% of non-ws chars triggers garbled detection → OCR fallback.
-  Removed the unreliable text_is_readable()/langdetect layer entirely.
-  Also fixed SyntaxWarning for \d in a docstring (escaped to \\d).
-  Action needed: re-run pdf_analyzer.py so Ovtsharenko is re-extracted with OCR.
+### Docling conversion
+  - DocumentConverter with PdfPipelineOptions
+  - OCR engine: TesseractCliOcrOptions (shells out to tesseract binary; reliable cross-platform)
+  - Languages: eng, rus, deu, spa, fra, ita, lat (selective OCR on blank/scanned pages by default;
+    force_full_page_ocr=True when garbled threshold is exceeded)
+  - Table structure: TableFormerMode.ACCURATE
+  - generate_picture_images=True, generate_page_images=True (required for table.get_image())
+  - images_scale=4.0 (high-resolution image extraction)
+  - Accelerator: device="auto" (docling default — auto-detects CUDA/MPS/XPU/CPU at runtime;
+    no code changes needed on GPU machines)
+
+### Table extraction (→ tables/)
+  - Each TableItem exported as CSV (export_to_dataframe(doc)), region PNG (get_image(doc)),
+    and _meta.json (caption, page_number, rows, cols, image_file, source_file, species)
+  - No Markdown export (CSV + meta is sufficient for RAG)
+  - table_slugs dict maps each table's self_ref → relative "tables/<slug>.csv" path,
+    passed to the chunker so chunk table entries point to the correct file
+
+### Picture extraction (→ images/)
+  - Each PictureItem saved as PNG (get_image(doc)) with _meta.json sidecar
+  - _meta.json includes image_quality metrics computed immediately after save:
+      width_px, height_px, megapixels, mode, is_color,
+      sharpness (variance of Laplacian — higher = sharper),
+      contrast (std-dev of luminance)
+    If the PNG is unexpectedly absent, image_quality is stored as null with a warning.
+
+### Chunking (→ chunks.json, initial pass)
+  - HybridChunker (sentence-transformers/all-MiniLM-L6-v2, 512-token window)
+  - Each chunk records: text, headings, item_types, source_file, species,
+    page_numbers, figures [], tables []
+  - PictureItem and TableItem doc_items are annotated directly; caption items are
+    resolved via a caption→picture_ref lookup built before chunking
+
+### Post-processing (overwrites chunks.json)
+  1. Fuzzy caption matching (rapidfuzz, threshold 85) — injects figure refs that
+     HybridChunker lost when it split chunks across PictureItem boundaries
+  2. image_file resolution — reads _meta.json sidecars to fill figure.image_file fields
+  3. Per-chunk deduplication — removes duplicate figure/table entries within a chunk
+  4. Cross-chunk deduplication — first-occurrence wins; duplicate picture_refs in later
+     chunks are removed
+  5. Fallback injection — uncaptioned figures (not fuzzy-matchable) are injected into the
+     first chunk whose page_numbers include the figure's page_number
+  6. Second cross-chunk dedup pass (safety, after fallback injection)
+  7. Oversized chunk splitting — any chunk exceeding 400 tokens is split at sentence
+     boundaries using the same tokenizer; figures/tables stay on the first sub-chunk,
+     headings/page_numbers propagate to all; single sentences > 400 t kept as-is
+
+### Batch execution
+  - Iterates all PDFs under INPUT_DIR (configured at top of __main__ block)
+  - chunks.json presence = completion marker; existing outputs are skipped on re-run
+  - Per-PDF run.log mirrors stdout (Tee class)
+  - Final summary: succeeded / failed / skipped counts
+
+## pdf_analyzer.py (legacy / helper)
+  Still present and used as a helper module:
+  - looks_garbled() is imported by pdf_processor.py for the pre-conversion garbled check
+  - Can still be run standalone to extract plain text + raw images from PDFs using
+    PyMuPDF + Tesseract (simpler output format: text.txt, metadata.json, images/)
+  - langdetect / text_is_readable() layer was removed (unreliable for longer garbled text);
+    garbled detection now relies solely on alpha-ratio + digit-in-word checks
+
+## History of Key Decisions & Bug Fixes
+
+### 2026-02-25 — pdf_analyzer.py garbled-text fix
+  Ovtsharenko_V_I_1979: Russian PDF with Cyrillic stored as Latin codepoints.
+  Alpha ratio was high enough to pass the original looks_garbled() check, and langdetect
+  confidently but wrongly identified the garbled text as English.
+  Fix: added digit-in-word rate check (> 0.5% of non-ws chars). Cyrillic digits З→'3',
+  б→'6' land mid-word in the misencoded output (e.g. "H3y", "pa6oTa"); this never
+  occurs in real text. langdetect / text_is_readable() removed entirely.
+  Also fixed SyntaxWarning for bare \d in a docstring (escaped to \\d).
+
+### 2026-02-25 — pdf_processor.py created (formerly exp.py)
+  Docling-based pipeline replacing the simpler pdf_analyzer.py approach for RAG use.
+  Richer output: structured document JSON, table CSVs + images, figure PNGs,
+  HybridChunker chunks with provenance metadata.
+
+### 2026-02-26 — figure injection post-processing integrated
+  HybridChunker loses PictureItem parent-child relationships when splitting.
+  fix_chunk_figures.py was first written as a standalone post-processor, then fully
+  integrated into pdf_processor.py as postprocess_chunks() (steps 1–6 above).
+  fix_chunk_figures.py is kept on disk for reference but is superseded.
+
+### 2026-02-26 — batch processing, skip logic, OCR engine fix
+  - __main__ updated to iterate all PDFs under INPUT_DIR
+  - Skip logic: chunks.json presence = complete; skips on re-run
+  - Default OCR changed from EasyOcrOptions to TesseractCliOcrOptions after EasyOCR
+    caused failures on machines without it installed
+  - export_to_dataframe() updated to pass doc argument (API change in docling 2.x)
+  - doc.num_pages side effect: calling it triggered verbose DoclingDocument repr being
+    printed; fixed by obtaining page_count from fitz pre-conversion instead
+
+### 2026-02-26 — oversized chunk splitting added
+  HybridChunker emits "Token indices sequence length > 512" warnings for long chunks.
+  Downstream embedding models silently truncate at 512 tokens, losing text.
+  Fix: split_oversized_chunks() added as step 7 of post-processing. Uses the same
+  tokenizer (all-MiniLM-L6-v2) to count tokens; splits at sentence boundaries;
+  threshold 400 tokens (leaves headroom for model special tokens).
+
+### 2026-03-01 — image quality metrics added to figure _meta.json
+  assess_image_quality() added: computes width, height, megapixels, colour mode,
+  sharpness (variance of Laplacian via scipy), and contrast (luminance std-dev).
+  Called immediately after each figure PNG is confirmed present on disk.
+  Result stored under "image_quality" key in images/<slug>_meta.json.
+  scipy>=1.10.0 and numpy>=1.24.0 added to requirements.txt.

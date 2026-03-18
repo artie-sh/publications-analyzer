@@ -12,9 +12,23 @@ Outputs written to out_dir/:
 """
 
 import json
+import logging
 import re
 import sys
+import time
+import warnings
 from pathlib import Path
+
+from tqdm import tqdm
+
+import numpy as np
+from scipy.ndimage import convolve
+
+# Suppress noisy but harmless library warnings
+warnings.filterwarnings("ignore", message=".*pin_memory.*")          # torch, no GPU
+warnings.filterwarnings("ignore", message=".*Token indices sequence.*")  # HybridChunker > 512 tokens
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)          # HF connectivity retries
+logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
 class Tee:
@@ -75,6 +89,63 @@ def get_page_numbers(item) -> list[int]:
     return sorted(set(pages))
 
 
+def page_count(pdf_path: Path) -> int:
+    """Return the number of pages in a PDF without reading any text (fast)."""
+    doc = fitz.open(str(pdf_path))
+    n = len(doc)
+    doc.close()
+    return n
+
+
+def assess_image_quality(image_path: str, bbox_pts: dict | None = None) -> dict:
+    """
+    Compute basic quality metrics for a saved PNG.
+
+    bbox_pts — optional dict with keys l, t, r, b in PDF points (from provenance).
+               When provided, DPI is derived from the ratio of pixel dimensions to
+               the bounding-box size; otherwise dpi is None.
+
+    Returns a dict with width_px, height_px, megapixels, mode, is_color,
+    sharpness (variance of Laplacian), contrast (std-dev of luminance), dpi,
+    and dpi_reliable.  On any failure returns {"error": <message>}.
+    """
+    try:
+        from PIL import Image as _Image
+        img = _Image.open(image_path)
+        gray = np.array(img.convert("L")).astype(np.float32)
+
+        kernel = np.array([[0,  1, 0],
+                           [1, -4, 1],
+                           [0,  1, 0]], dtype=np.float32)
+        laplacian = convolve(gray, kernel)
+        sharpness = float(np.var(laplacian))
+
+        width_px  = img.width
+        height_px = img.height
+
+        if bbox_pts:
+            bbox_w_pts = bbox_pts["r"] - bbox_pts["l"]
+            bbox_h_pts = bbox_pts["b"] - bbox_pts["t"]
+            dpi_x = round(width_px  / (bbox_w_pts / 72)) if bbox_w_pts > 0 else None
+            dpi_y = round(height_px / (bbox_h_pts / 72)) if bbox_h_pts > 0 else None
+        else:
+            dpi_x, dpi_y = None, None
+
+        return {
+            "width_px":    width_px,
+            "height_px":   height_px,
+            "megapixels":  round((width_px * height_px) / 1e6, 3),
+            "mode":        img.mode,
+            "is_color":    img.mode in ("RGB", "RGBA"),
+            "sharpness":   round(sharpness, 2),
+            "contrast":    round(float(gray.std()), 2),
+            "dpi":         dpi_x,
+            "dpi_reliable": dpi_x is not None,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Step 0 — pre-check + convert
 # ---------------------------------------------------------------------------
@@ -112,7 +183,7 @@ def convert_pdf(
     Returns (DoclingDocument, page_count).
     """
     if ocr_langs is None:
-        ocr_langs = ["eng", "rus", "deu", "spa", "fra", "ita", "lat"]
+        ocr_langs = ["eng", "rus", "ukr", "deu", "spa", "fra", "ita", "lat"]
 
     ratio, page_count = garbled_ratio(source)
     force_ocr = ratio > garbled_threshold
@@ -123,11 +194,11 @@ def convert_pdf(
 
     pipeline_options = PdfPipelineOptions()
     pipeline_options.do_ocr = True
-    pipeline_options.ocr_options = EasyOcrOptions()
+    pipeline_options.ocr_options = TesseractCliOcrOptions(lang=ocr_langs)  # selective OCR on blank/scanned pages
     pipeline_options.do_table_structure = True
     pipeline_options.table_structure_options.mode = table_mode
     pipeline_options.generate_picture_images = True
-    pipeline_options.generate_table_images = False
+    pipeline_options.generate_page_images = True   # required for table.get_image()
     pipeline_options.images_scale = images_scale
 
     if force_ocr:
@@ -186,23 +257,29 @@ def extract_tables(
         pages = get_page_numbers(table)
 
         try:
-            df = table.export_to_dataframe()
+            df = table.export_to_dataframe(doc)
             df.to_csv(tables_dir / csv_name, index=False)
+
+            img = table.get_image(doc)
+            if img:
+                img.save(tables_dir / f"{slug}.png")
 
             meta = {
                 "caption": caption,
                 "page_number": pages[0] if pages else None,
                 "rows": df.shape[0],
                 "cols": df.shape[1],
+                "image_file": f"tables/{slug}.png" if img else None,
                 "source_file": source_file,
                 "species": species,
             }
             (tables_dir / f"{slug}_meta.json").write_text(
                 json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
             )
+            img_note = "  +img" if img else ""
             print(
                 f"  Table {i}: {caption[:80] or '(no caption)'}"
-                f"  [{df.shape[0]}×{df.shape[1]}]  p.{pages}  ✓"
+                f"  [{df.shape[0]}×{df.shape[1]}]  p.{pages}{img_note}  ✓"
             )
             ok += 1
         except Exception as e:
@@ -242,11 +319,24 @@ def extract_pictures(
 
         print(f"  Picture {i}: {caption[:120] or '(no caption)'}  p.{pages}")
         try:
+            png_path = images_dir / f"{slug}.png"
             img = pic.get_image(doc)
             if img:
-                img.save(images_dir / f"{slug}.png")
+                img.save(png_path)
             else:
                 print("    (no image data)")
+
+            bbox_pts = None
+            if pic.prov:
+                b = pic.prov[0].bbox
+                if b is not None:
+                    bbox_pts = {"l": b.l, "t": b.t, "r": b.r, "b": b.b}
+
+            if png_path.exists():
+                image_quality = assess_image_quality(str(png_path), bbox_pts=bbox_pts)
+            else:
+                print(f"    Warning: {png_path.name} not found — image_quality set to null")
+                image_quality = None
 
             meta = {
                 "caption": caption,
@@ -254,6 +344,7 @@ def extract_pictures(
                 "picture_ref": pic.self_ref,
                 "source_file": source_file,
                 "species": species,
+                "image_quality": image_quality,
             }
             (images_dir / f"{slug}_meta.json").write_text(
                 json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -510,6 +601,82 @@ def dedup_cross_chunk(chunks: list[dict]) -> int:
     return removed
 
 
+def split_oversized_chunks(
+    chunks: list[dict],
+    max_tokens: int = 400,
+    model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+) -> tuple[list[dict], int]:
+    """
+    Split any chunk whose text exceeds max_tokens into smaller sub-chunks,
+    splitting at sentence boundaries where possible.
+
+    Uses the same tokenizer as HybridChunker so token counts are consistent.
+    Headings and page_numbers are propagated to all sub-chunks.
+    Figures and tables are attached to the first sub-chunk only (they belong
+    to the beginning of the original chunk's context).
+
+    Returns (new_chunks_list, count_of_chunks_that_were_split).
+    """
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+    except Exception as e:
+        print(f"  Warning: could not load tokenizer ({e}) — skipping oversized chunk split.")
+        return chunks, 0
+
+    def count_tokens(text: str) -> int:
+        return len(tokenizer.encode(text, add_special_tokens=True))
+
+    # Split on sentence-ending punctuation followed by whitespace
+    sent_re = re.compile(r'(?<=[.!?])\s+')
+
+    split_count = 0
+    result: list[dict] = []
+
+    for chunk in chunks:
+        text = chunk.get("text", "")
+        if count_tokens(text) <= max_tokens:
+            result.append(chunk)
+            continue
+
+        sentences = sent_re.split(text)
+        sub_texts: list[str] = []
+        current = ""
+
+        for sent in sentences:
+            candidate = (current + " " + sent).strip() if current else sent
+            if current and count_tokens(candidate) > max_tokens:
+                sub_texts.append(current)
+                current = sent
+            else:
+                current = candidate
+
+        if current:
+            sub_texts.append(current)
+
+        if len(sub_texts) <= 1:
+            # Single sentence already > max_tokens — keep as-is; nothing to split
+            result.append(chunk)
+            continue
+
+        split_count += 1
+        for j, sub_text in enumerate(sub_texts):
+            sub: dict = {
+                "text":         sub_text,
+                "headings":     chunk.get("headings", []),
+                "item_types":   chunk.get("item_types", []),
+                "source_file":  chunk.get("source_file", ""),
+                "species":      chunk.get("species", ""),
+                "page_numbers": chunk.get("page_numbers", []),
+                # Figures/tables belong to the first sub-chunk only
+                "figures":      chunk.get("figures", []) if j == 0 else [],
+                "tables":       chunk.get("tables", []) if j == 0 else [],
+            }
+            result.append(sub)
+
+    return result, split_count
+
+
 def inject_fallback_figures(chunks: list[dict], images_dir: Path) -> int:
     """
     Inject figures with empty captions (not fuzzy-matchable) by matching
@@ -563,6 +730,7 @@ def postprocess_chunks(
     doc,
     out_dir: Path,
     fuzzy_threshold: int = 85,
+    max_tokens: int = 400,
     filename: str = "chunks.json",
 ) -> dict:
     """
@@ -575,19 +743,24 @@ def postprocess_chunks(
       4. Cross-chunk deduplication (first occurrence wins)
       5. Fallback injection for uncaptioned figures (by page number)
       6. Second cross-chunk dedup pass (safety)
+      7. Split oversized chunks at sentence boundaries (max_tokens)
 
     Returns stats dict.
     """
     images_dir = out_dir / "images"
     print(f"\n=== Post-processing Chunks ===")
 
-    fuzzy_injected      = fix_figure_refs(chunks, doc, fuzzy_threshold)
+    fuzzy_injected       = fix_figure_refs(chunks, doc, fuzzy_threshold)
     image_files_resolved = resolve_image_files(chunks, images_dir)
     dedup_per_chunk(chunks)
-    cross_chunk_removed = dedup_cross_chunk(chunks)
-    fallback_injected   = inject_fallback_figures(chunks, images_dir)
+    cross_chunk_removed  = dedup_cross_chunk(chunks)
+    fallback_injected    = inject_fallback_figures(chunks, images_dir)
     if fallback_injected:
         cross_chunk_removed += dedup_cross_chunk(chunks)
+
+    chunks, oversized_split = split_oversized_chunks(chunks, max_tokens=max_tokens)
+    if oversized_split:
+        print(f"  Split {oversized_split} oversized chunk(s) at sentence boundaries.")
 
     (out_dir / filename).write_text(
         json.dumps(chunks, indent=2, ensure_ascii=False),
@@ -600,6 +773,7 @@ def postprocess_chunks(
         "fallback_injected":    fallback_injected,
         "image_files_resolved": image_files_resolved,
         "cross_chunk_removed":  cross_chunk_removed,
+        "oversized_split":      oversized_split,
     }
 
 
@@ -627,7 +801,45 @@ def print_summary(
     figure refs injected (fallback) : {pp_stats['fallback_injected']}
     image files resolved            : {pp_stats['image_files_resolved']}
     cross-chunk duplicates removed  : {pp_stats['cross_chunk_removed']}
+    oversized chunks split (≤400t)  : {pp_stats['oversized_split']}
 """)
+
+
+# ---------------------------------------------------------------------------
+# Per-file processing
+# ---------------------------------------------------------------------------
+
+def process_pdf(pdf_path: Path, out_base: Path) -> bool:
+    """
+    Run the full pipeline for a single PDF.
+
+    Output is written to out_base/<species>/<pdf_stem>/.
+    A run.log is written there as well.
+
+    Returns True on success, False on failure.
+    """
+    species = pdf_path.parent.name
+    out_dir = out_base / species / pdf_path.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(out_dir / "run.log", "w", encoding="utf-8") as _log_fh:
+        sys.stdout = Tee(sys.__stdout__, _log_fh)
+        try:
+            doc, n_pages = convert_pdf(pdf_path)
+
+            table_slugs, table_stats = extract_tables(doc, out_dir, pdf_path.name, species)
+            picture_stats            = extract_pictures(doc, out_dir, pdf_path.name, species)
+            save_document_json(doc, out_dir)
+            chunks, chunk_stats      = build_chunks(doc, out_dir, pdf_path.name, species, table_slugs)
+            pp_stats                 = postprocess_chunks(chunks, doc, out_dir)
+
+            print_summary(n_pages, table_stats, picture_stats, chunk_stats, pp_stats)
+            return True
+        except Exception as exc:
+            print(f"ERROR: {exc}")
+            return False
+        finally:
+            sys.stdout = sys.__stdout__
 
 
 # ---------------------------------------------------------------------------
@@ -635,29 +847,81 @@ def print_summary(
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # SOURCE = Path(
-    #     "/home/artie-sh/repos/spiders/exp_clean/Pardosa_abagensis/"
-    #     "Tikader_B_K_1977d_Description_of_two_new_species_of_wolf-spider_family_Lycosidae_from_Ladakh_India_1.pdf"
-    # )
-    SOURCE = Path(
-        "/home/artie-sh/repos/spiders/exp_clean/Pardosa_abagensis/"
-        "Nadolny_A_A__Kovblyuk_M_M_2012_Members_of_Pardosa_amentata_and_P_lugubris_species_groups_in_Crimea_and_Caucasus_with_notes_on_P_abagensis_Aranei_Lycosidae.pdf"
-    )
-    OUT_DIR = Path("/home/artie-sh/repos/spiders/exp_clean_processed/exp_docling11")
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    INPUT_DIR = Path("/home/artie-sh/repos/spiders/exp_clean/classifier")
+    OUT_BASE  = Path("/home/artie-sh/repos/spiders/exp_clean_processed")
 
-    with open(OUT_DIR / "run.log", "w", encoding="utf-8") as _log_fh:
-        sys.stdout = Tee(sys.__stdout__, _log_fh)
-        try:
-            doc, page_count = convert_pdf(SOURCE)
-            species = SOURCE.parent.name
+    pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
+    if not pdf_files:
+        print(f"No PDF files found under {INPUT_DIR}")
+        raise SystemExit(0)
 
-            table_slugs, table_stats = extract_tables(doc, OUT_DIR, SOURCE.name, species)
-            picture_stats = extract_pictures(doc, OUT_DIR, SOURCE.name, species)
-            save_document_json(doc, OUT_DIR)
-            chunks, chunk_stats = build_chunks(doc, OUT_DIR, SOURCE.name, species, table_slugs)
-            pp_stats = postprocess_chunks(chunks, doc, OUT_DIR)
+    print(f"Found {len(pdf_files)} PDF(s) under {INPUT_DIR}\n")
 
-            print_summary(page_count, table_stats, picture_stats, chunk_stats, pp_stats)
-        finally:
-            sys.stdout = sys.__stdout__
+    # Pre-scan: cheap fitz page count (no text extraction) for each PDF that
+    # still needs processing.  PDFs whose output folder already contains
+    # chunks.json are marked None and will be skipped.
+    print("Pre-scanning page counts...", end=" ", flush=True)
+    pdf_info: list[tuple[Path, int | None]] = []
+    for pdf_path in pdf_files:
+        done_marker = OUT_BASE / pdf_path.parent.name / pdf_path.stem / "chunks.json"
+        if done_marker.exists():
+            pdf_info.append((pdf_path, None))          # None → skip
+        else:
+            pdf_info.append((pdf_path, page_count(pdf_path)))
+
+    to_process  = sum(1 for _, n in pdf_info if n is not None)
+    skipped_pre = len(pdf_files) - to_process
+    total_pages = sum(n for _, n in pdf_info if n is not None)
+    print("done.")
+    print(f"To process : {to_process} PDF(s), {total_pages} pages total")
+    print(f"Skipping   : {skipped_pre} (chunks.json already present)\n")
+
+    ok = fail = 0
+    pages_done = 0
+    time_spent = 0.0
+
+    with tqdm(
+        total=total_pages,
+        unit="pg",
+        desc="Total progress",
+        dynamic_ncols=True,
+        file=sys.stderr,
+    ) as pbar:
+        for i, (pdf_path, n_pages) in enumerate(pdf_info, 1):
+            species = pdf_path.parent.name
+            page_note = f"  ({n_pages} pages)" if n_pages is not None else ""
+
+            tqdm.write(f"\n{'─' * 60}")
+            tqdm.write(f"[{i}/{len(pdf_files)}] {species} / {pdf_path.name}{page_note}")
+            tqdm.write(f"{'─' * 60}")
+
+            if n_pages is None:
+                tqdm.write("  SKIP — chunks.json already present.")
+                continue
+
+            t0 = time.perf_counter()
+            success = process_pdf(pdf_path, OUT_BASE)
+            elapsed = time.perf_counter() - t0
+
+            if success:
+                ok += 1
+            else:
+                fail += 1
+
+            pages_done += n_pages
+            time_spent += elapsed
+            avg = time_spent / pages_done
+
+            pbar.update(n_pages)
+            pbar.set_postfix({
+                "done": f"{ok + fail}/{to_process}",
+                "last": f"{elapsed:.0f}s / {n_pages}pg",
+                "avg":  f"{avg:.2f}s/pg",
+            })
+
+    print(f"\n{'═' * 60}")
+    print(f"Batch complete:  {ok} succeeded,  {fail} failed,  {skipped_pre} skipped")
+    if pages_done:
+        print(f"Pages processed: {pages_done}  |  avg {time_spent / pages_done:.2f}s/page"
+              f"  |  total {time_spent:.0f}s")
+    print(f"{'═' * 60}")
