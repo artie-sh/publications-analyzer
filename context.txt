@@ -12,12 +12,18 @@ biologist friend process arachnology literature.
   pardosa/                    - deduplicated version of downloads/; one canonical copy of
       <Species_name>/             each PDF is kept, duplicate copies replaced with symlinks,
           Author_Year_Title.pdf   so the per-species folder structure is preserved.
+  classifier/                 - hand-picked sample PDFs for developing the quality classifier.
+      <N> type_Author_Year.pdf    prefix N = quality tier (1=lowest … 4=highest) based on
+                                  scientific usefulness: image quality, text parsability,
+                                  relevance to spider taxonomy.
+  classifier_processed/       - output of pdf_processor.py run against classifier/
   exp_clean/                  - small hand-picked subset of pardosa/ used for iterating on
       <Species_name>/             scripts without processing the full corpus.
           Author_Year_Title.pdf
   exp_clean_processed/        - output of pdf_processor.py (primary pipeline output)
       <Species_name>/
           Author_Year_Title/
+              doc_stats.json  - aggregated quality signals for the document (see below)
               document.json   - full Docling document model (structure, bboxes, provenance)
               chunks.json     - RAG-ready chunks with text, headings, page numbers,
                                 figure refs, table refs (post-processed, max 400 tokens)
@@ -28,15 +34,14 @@ biologist friend process arachnology literature.
                   <slug>_meta.json    - caption, page_number, rows, cols, image_file,
                                         source_file, species
               images/
-                  <slug>.png          - figure image
+                  <slug>.png          - figure image (decorative images filtered out)
                   <slug>_meta.json    - caption, page_number, picture_ref, source_file,
                                         species, image_quality (width_px, height_px,
-                                        megapixels, mode, is_color, sharpness, contrast)
+                                        megapixels, aspect_ratio, mode, sharpness, contrast,
+                                        dpi, dpi_reliable)
   scripts/
       pdf_processor.py        - primary pipeline: Docling extraction → tables → figures
-                                → chunks → post-processing (step 1, see below)
-      pdf_analyzer.py         - legacy PyMuPDF + Tesseract script; looks_garbled() helper
-                                is still imported by pdf_processor.py for its pre-check
+                                → chunks → post-processing → doc_stats.json (step 1, see below)
       fix_chunk_figures.py    - standalone post-processing script (superseded; logic
                                 fully integrated into pdf_processor.py — kept for reference)
       duplicates_remover.py   - replaces duplicate PDFs in downloads/ with symlinks → pardosa/
@@ -46,26 +51,29 @@ biologist friend process arachnology literature.
 
 ## Pipeline
   Step 1 — PDF extraction    [DONE]   scripts/pdf_processor.py
-                                        (replaces earlier pdf_analyzer.py approach)
   Step 2 — Chunking          [DONE]   integrated into pdf_processor.py via HybridChunker;
                                         chunks written to chunks.json per PDF
-  Step 3 — Embedding                   embed chunk texts with a vector model
-  Step 4 — Vector store                store embeddings + metadata in a DB (e.g. ChromaDB)
-  Step 5 — RAG query layer             retrieve chunks + pass to LLM for answers
+  Step 3 — Classification              use doc_stats.json + chunks.json to classify each
+                                        document into quality tiers 1–4 via an LLM
+  Step 4 — Embedding                   embed chunk texts with a vector model
+  Step 5 — Vector store                store embeddings + metadata in a DB (e.g. ChromaDB)
+  Step 6 — RAG query layer             retrieve chunks + pass to LLM for answers
 
 ## Step 1 Details — pdf_processor.py
 Primary script. Processes each PDF through a multi-stage pipeline:
 
 ### Pre-check (garbled text detection)
-  Uses pdf_analyzer.looks_garbled() via PyMuPDF (fitz) to scan every page before Docling
-  conversion. If > 30% of text-bearing pages are garbled (font-encoding artifacts, typically
-  Soviet-era Russian papers with Cyrillic stored as Latin codepoints), forces full-page OCR.
+  looks_garbled() (defined in pdf_processor.py) scans every page via PyMuPDF (fitz) before
+  Docling conversion. If > 30% of text-bearing pages are garbled (font-encoding artifacts,
+  typically Soviet-era Russian papers with Cyrillic stored as Latin codepoints), forces
+  full-page OCR. garbled_ratio and force_ocr are returned by convert_pdf() and stored in
+  doc_stats.json.
 
 ### Docling conversion
   - DocumentConverter with PdfPipelineOptions
   - OCR engine: TesseractCliOcrOptions (shells out to tesseract binary; reliable cross-platform)
-  - Languages: eng, rus, deu, spa, fra, ita, lat (selective OCR on blank/scanned pages by default;
-    force_full_page_ocr=True when garbled threshold is exceeded)
+  - Languages: eng, rus, ukr, deu, spa, fra, ita, lat (selective OCR on blank/scanned pages
+    by default; force_full_page_ocr=True when garbled threshold is exceeded)
   - Table structure: TableFormerMode.ACCURATE
   - generate_picture_images=True, generate_page_images=True (required for table.get_image())
   - images_scale=4.0 (high-resolution image extraction)
@@ -81,10 +89,14 @@ Primary script. Processes each PDF through a multi-stage pipeline:
 
 ### Picture extraction (→ images/)
   - Each PictureItem saved as PNG (get_image(doc)) with _meta.json sidecar
+  - Images with aspect ratio > 5:1 (either orientation) are skipped as decorative
+    (e.g. horizontal rules, ornamental bars); skipped count recorded in doc_stats.json
   - _meta.json includes image_quality metrics computed immediately after save:
-      width_px, height_px, megapixels, mode, is_color,
+      width_px, height_px, megapixels, aspect_ratio,
+      mode (raw PIL mode string),
       sharpness (variance of Laplacian — higher = sharper),
-      contrast (std-dev of luminance)
+      contrast (std-dev of luminance),
+      dpi, dpi_reliable (derived from bbox provenance if available)
     If the PNG is unexpectedly absent, image_quality is stored as null with a warning.
 
 ### Chunking (→ chunks.json, initial pass)
@@ -108,19 +120,25 @@ Primary script. Processes each PDF through a multi-stage pipeline:
      boundaries using the same tokenizer; figures/tables stay on the first sub-chunk,
      headings/page_numbers propagate to all; single sentences > 400 t kept as-is
 
+### doc_stats.json (document-level quality signals)
+  Written after post-processing. Intended as the primary input for the quality classifier
+  (Step 3), providing pre-aggregated signals without requiring the classifier to iterate
+  individual _meta.json files:
+    source_file, species, page_count
+    garbled_ratio    — fraction of text-bearing pages whose native text was garbled
+    force_ocr        — whether full-page OCR was forced
+    chunks           — total, with_figures (post-processed), with_tables (post-processed)
+    tables           — total, ok, fail
+    images           — total, saved, skipped (aspect ratio filtered), fail
+                       sharpness: {min, max, avg}
+                       megapixels: {min, max, avg}
+
 ### Batch execution
   - Iterates all PDFs under INPUT_DIR (configured at top of __main__ block)
   - chunks.json presence = completion marker; existing outputs are skipped on re-run
   - Per-PDF run.log mirrors stdout (Tee class)
+  - Progress bar shows total pages, per-PDF time, running avg seconds/page
   - Final summary: succeeded / failed / skipped counts
-
-## pdf_analyzer.py (legacy / helper)
-  Still present and used as a helper module:
-  - looks_garbled() is imported by pdf_processor.py for the pre-conversion garbled check
-  - Can still be run standalone to extract plain text + raw images from PDFs using
-    PyMuPDF + Tesseract (simpler output format: text.txt, metadata.json, images/)
-  - langdetect / text_is_readable() layer was removed (unreliable for longer garbled text);
-    garbled detection now relies solely on alpha-ratio + digit-in-word checks
 
 ## History of Key Decisions & Bug Fixes
 
@@ -166,3 +184,19 @@ Primary script. Processes each PDF through a multi-stage pipeline:
   Called immediately after each figure PNG is confirmed present on disk.
   Result stored under "image_quality" key in images/<slug>_meta.json.
   scipy>=1.10.0 and numpy>=1.24.0 added to requirements.txt.
+
+### 2026-03-22 — pdf_analyzer.py removed; looks_garbled() merged into pdf_processor.py
+  pdf_analyzer.py deleted. looks_garbled() and MIN_ALPHA_RATIO constant now live
+  directly in pdf_processor.py. No functional change.
+
+### 2026-03-22 — decorative image filtering, image_quality cleanup, doc_stats.json
+  - extract_pictures() now skips images with aspect ratio > 5:1 (decorative bars,
+    horizontal rules); skipped count tracked in picture_stats and doc_stats.json.
+  - assess_image_quality(): removed is_color (always RGB after conversion, not meaningful);
+    added aspect_ratio field.
+  - doc_stats.json added per document: garbled_ratio, force_ocr, chunk counts
+    (post-processed), table counts, image counts + sharpness/megapixels aggregates.
+    Intended as single-file input for the Step 3 quality classifier.
+  - Fixed summary stats bug: "with figures / with tables" chunk counts were computed
+    before post-processing (always 0); now taken from the final post-processed list.
+  - convert_pdf() now returns (doc, page_count, garbled_ratio, force_ocr).
