@@ -7,5 +7,5 @@
 create_links.ps1
 */__pycache__
 /pardosa_parsed
-/classifier_processed
-/classifier
+/classifier*
+pardosa_classification_rubric_v3.docx

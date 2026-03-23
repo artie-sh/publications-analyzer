@@ -18,6 +18,7 @@ import re
 import sys
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
@@ -302,7 +303,7 @@ def extract_tables(
         pages = get_page_numbers(table)
         page_no = pages[0] if pages else 0
         page_counters[page_no] = page_counters.get(page_no, 0) + 1
-        slug = f"page{page_no:03d}_tbl{page_counters[page_no]}"
+        slug = f"page_{page_no:03d}_tbl_{page_counters[page_no]}"
         csv_name = f"{slug}.csv"
         table_slugs[table.self_ref] = f"{tables_subdir}/{csv_name}"
 
@@ -369,7 +370,7 @@ def extract_pictures(
         pages = get_page_numbers(pic)
         page_no = pages[0] if pages else 0
         page_counters[page_no] = page_counters.get(page_no, 0) + 1
-        slug = f"page{page_no:03d}_img{page_counters[page_no]}"
+        slug = f"page_{page_no:03d}_img_{page_counters[page_no]}"
 
         print(f"  Picture {i}: {caption[:120] or '(no caption)'}  p.{pages}")
         try:
@@ -942,7 +943,7 @@ def save_doc_stats(
 # Per-file processing
 # ---------------------------------------------------------------------------
 
-def process_pdf(pdf_path: Path, out_dir: Path) -> bool:
+def process_pdf(pdf_path: Path, out_dir: Path, quiet: bool = False) -> bool:
     """
     Run the full pipeline for a single PDF.
 
@@ -950,13 +951,17 @@ def process_pdf(pdf_path: Path, out_dir: Path) -> bool:
     the desired output path (with or without a species-level subfolder).
     A run.log is written to out_dir as well.
 
+    quiet=True suppresses stdout mirroring (used when running inside a worker
+    process so that output from parallel workers does not interleave on the
+    terminal — the run.log still captures everything).
+
     Returns True on success, False on failure.
     """
     species = pdf_path.parent.name
     out_dir.mkdir(parents=True, exist_ok=True)
 
     with open(out_dir / "run.log", "w", encoding="utf-8") as _log_fh:
-        sys.stdout = Tee(sys.__stdout__, _log_fh)
+        sys.stdout = _log_fh if quiet else Tee(sys.__stdout__, _log_fh)
         try:
             doc, n_pages, g_ratio, force_ocr = convert_pdf(pdf_path)
 
@@ -987,6 +992,12 @@ if __name__ == "__main__":
     INPUT_DIR = Path("/home/artie-sh/repos/spiders/classifier")
     OUT_BASE  = Path("/home/artie-sh/repos/spiders/classifier_processed")
 
+    # Number of parallel worker processes.
+    # On a GPU instance (e.g. EC2 g5.2xlarge, 1× A10G) keep this at 2–4:
+    # Docling shares the GPU for TableFormer, so too many workers will OOM.
+    # Override at runtime: WORKERS=2 python3 scripts/pdf_processor.py
+    WORKERS = int(os.environ.get("WORKERS", 4))
+
     pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
     if not pdf_files:
         print(f"No PDF files found under {INPUT_DIR}")
@@ -994,10 +1005,6 @@ if __name__ == "__main__":
 
     print(f"Found {len(pdf_files)} PDF(s) under {INPUT_DIR}\n")
 
-    # Pre-scan: cheap fitz page count (no text extraction) for each PDF that
-    # still needs processing.  PDFs whose output folder already contains
-    # chunks.json are marked None and will be skipped.
-    print("Pre-scanning page counts...", end=" ", flush=True)
     def out_dir_for(pdf_path: Path) -> Path:
         """Output folder for a PDF. Flat under OUT_BASE when PDFs sit directly
         inside INPUT_DIR; one species-level subfolder otherwise."""
@@ -1005,11 +1012,21 @@ if __name__ == "__main__":
             return OUT_BASE / pdf_path.stem
         return OUT_BASE / pdf_path.parent.name / pdf_path.stem
 
+    # Separate real files from symlinks.
+    # Symlinks are duplicate references to already-canonical PDFs; we process
+    # only real files and recreate the symlink structure in the output tree.
+    real_pdfs    = [p for p in pdf_files if not p.is_symlink()]
+    symlink_pdfs = [p for p in pdf_files if p.is_symlink()]
+    print(f"Real PDFs  : {len(real_pdfs)}")
+    print(f"Symlinks   : {len(symlink_pdfs)} (will mirror to output tree after processing)\n")
+
+    # Pre-scan: cheap fitz page count for PDFs still needing processing.
+    # PDFs whose output already contains chunks.json are skipped.
+    print("Pre-scanning page counts...", end=" ", flush=True)
     pdf_info: list[tuple[Path, int | None]] = []
-    for pdf_path in pdf_files:
-        done_marker = out_dir_for(pdf_path) / "chunks.json"
-        if done_marker.exists():
-            pdf_info.append((pdf_path, None))          # None → skip
+    for pdf_path in real_pdfs:
+        if (out_dir_for(pdf_path) / "chunks.json").exists():
+            pdf_info.append((pdf_path, None))   # None → skip
         else:
             pdf_info.append((pdf_path, page_count(pdf_path)))
 
@@ -1018,11 +1035,19 @@ if __name__ == "__main__":
     total_pages = sum(n for _, n in pdf_info if n is not None)
     print("done.")
     print(f"To process : {to_process} PDF(s), {total_pages} pages total")
-    print(f"Skipping   : {skipped_pre} (chunks.json already present)\n")
+    print(f"Skipping   : {skipped_pre} (chunks.json already present)")
+    print(f"Workers    : {WORKERS}\n")
 
     ok = fail = 0
     pages_done = 0
-    time_spent = 0.0
+    t_batch_start = time.perf_counter()
+
+    # Log skipped files upfront so they don't clutter the live progress output.
+    for pdf_path, n_pages in pdf_info:
+        if n_pages is None:
+            tqdm.write(f"SKIP  {pdf_path.parent.name}/{pdf_path.name}")
+
+    pending = [(pdf_path, n) for pdf_path, n in pdf_info if n is not None]
 
     with tqdm(
         total=total_pages,
@@ -1031,41 +1056,75 @@ if __name__ == "__main__":
         dynamic_ncols=True,
         file=sys.stderr,
     ) as pbar:
-        for i, (pdf_path, n_pages) in enumerate(pdf_info, 1):
-            species = pdf_path.parent.name
-            page_note = f"  ({n_pages} pages)" if n_pages is not None else ""
+        with ProcessPoolExecutor(max_workers=WORKERS) as executor:
+            future_to_info = {
+                executor.submit(process_pdf, pdf_path, out_dir_for(pdf_path), True): (pdf_path, n_pages)
+                for pdf_path, n_pages in pending
+            }
 
-            tqdm.write(f"\n{'─' * 60}")
-            tqdm.write(f"[{i}/{len(pdf_files)}] {species} / {pdf_path.name}{page_note}")
-            tqdm.write(f"{'─' * 60}")
+            for future in as_completed(future_to_info):
+                pdf_path, n_pages = future_to_info[future]
+                elapsed = time.perf_counter() - t_batch_start  # wall time so far
 
-            if n_pages is None:
-                tqdm.write("  SKIP — chunks.json already present.")
-                continue
+                try:
+                    success = future.result()
+                except Exception as exc:
+                    tqdm.write(f"ERROR  {pdf_path.name}: {exc}")
+                    success = False
 
-            t0 = time.perf_counter()
-            success = process_pdf(pdf_path, out_dir_for(pdf_path))
-            elapsed = time.perf_counter() - t0
+                status = "OK  " if success else "FAIL"
+                if success:
+                    ok += 1
+                else:
+                    fail += 1
 
-            if success:
-                ok += 1
-            else:
-                fail += 1
+                pages_done += n_pages
+                tqdm.write(f"{status}  {pdf_path.parent.name}/{pdf_path.name}  ({n_pages} pg)")
 
-            pages_done += n_pages
-            time_spent += elapsed
-            avg = time_spent / pages_done
+                pbar.update(n_pages)
+                pbar.set_postfix({
+                    "done":    f"{ok + fail}/{to_process}",
+                    "ok/fail": f"{ok}/{fail}",
+                    "pg/s":    f"{pages_done / max(elapsed, 1):.1f}",
+                })
 
-            pbar.update(n_pages)
-            pbar.set_postfix({
-                "done": f"{ok + fail}/{to_process}",
-                "last": f"{elapsed:.0f}s / {n_pages}pg",
-                "avg":  f"{avg:.2f}s/pg",
-            })
-
+    total_elapsed = time.perf_counter() - t_batch_start
     print(f"\n{'═' * 60}")
     print(f"Batch complete:  {ok} succeeded,  {fail} failed,  {skipped_pre} skipped")
     if pages_done:
-        print(f"Pages processed: {pages_done}  |  avg {time_spent / pages_done:.2f}s/page"
-              f"  |  total {time_spent:.0f}s")
+        print(f"Pages processed: {pages_done}  |  {pages_done / total_elapsed:.1f} pg/s"
+              f"  |  total {total_elapsed:.0f}s")
     print(f"{'═' * 60}")
+
+    # Mirror symlinks into the output tree.
+    # For each symlink in the input, create a symlink in the output that points
+    # to the canonical output folder (relative path, same as input convention).
+    if symlink_pdfs:
+        print(f"\nMirroring {len(symlink_pdfs)} symlink(s) into output tree...")
+        sym_ok = sym_skip = sym_fail = 0
+        for link_path in symlink_pdfs:
+            try:
+                canonical_pdf = link_path.resolve()
+                canonical_out = out_dir_for(canonical_pdf)
+
+                # Only create the symlink if the canonical output was actually produced
+                if not canonical_out.exists():
+                    print(f"  SKIP  {link_path.name} — canonical output not found: {canonical_out}")
+                    sym_skip += 1
+                    continue
+
+                link_out = out_dir_for(link_path)
+                if link_out.exists() or link_out.is_symlink():
+                    sym_skip += 1
+                    continue
+
+                link_out.parent.mkdir(parents=True, exist_ok=True)
+                rel_target = os.path.relpath(canonical_out, link_out.parent)
+                link_out.symlink_to(rel_target)
+                print(f"  LINK  {link_out.parent.name}/{link_out.name} → {rel_target}")
+                sym_ok += 1
+            except Exception as exc:
+                print(f"  FAIL  {link_path.name}: {exc}")
+                sym_fail += 1
+
+        print(f"Symlinks:  {sym_ok} created,  {sym_skip} skipped,  {sym_fail} failed")
