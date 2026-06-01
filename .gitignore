@@ -9,3 +9,9 @@ create_links.ps1
 /pardosa_parsed
 /classifier*
 pardosa_classification_rubric_v3.docx
+.env
+finalization/
+pardosa_processed/
+scan_ocr.txt
+species_map.json
+scan_native.txt

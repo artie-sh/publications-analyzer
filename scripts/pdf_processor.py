@@ -15,10 +15,12 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 import time
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from tqdm import tqdm
@@ -217,6 +219,29 @@ def garbled_ratio(pdf_path: Path) -> tuple[float, int]:
     return (garbled / total if total else 0.0), page_count
 
 
+def is_image_only(pdf_path: Path, n_pages: int, threshold: int = 20) -> bool:
+    """
+    Return True if the PDF has virtually no extractable text — i.e. it is a
+    scanned/image-only document that needs vision-based processing.
+
+    threshold: maximum average non-whitespace chars per page to still be
+               considered image-only (default 20 — a page needs essentially
+               nothing to exceed this).
+    """
+    if not n_pages:
+        return False
+    try:
+        doc = fitz.open(str(pdf_path))
+        total_nws = sum(
+            sum(1 for c in page.get_text() if not c.isspace())
+            for page in doc
+        )
+        doc.close()
+        return (total_nws / n_pages) < threshold
+    except Exception:
+        return False
+
+
 def convert_pdf(
     source: Path,
     *,
@@ -246,7 +271,7 @@ def convert_pdf(
     pipeline_options.do_table_structure = True
     pipeline_options.table_structure_options.mode = table_mode
     pipeline_options.generate_picture_images = True
-    pipeline_options.generate_page_images = True   # required for table.get_image()
+    pipeline_options.generate_page_images = False  # table PNGs skipped; saves significant memory
     pipeline_options.images_scale = images_scale
 
     if force_ocr:
@@ -311,26 +336,20 @@ def extract_tables(
             df = table.export_to_dataframe(doc)
             df.to_csv(tables_dir / csv_name, index=False)
 
-            img = table.get_image(doc)
-            if img:
-                img.save(tables_dir / f"{slug}.png")
-
             meta = {
                 "caption": caption,
                 "page_number": pages[0] if pages else None,
                 "rows": df.shape[0],
                 "cols": df.shape[1],
-                "image_file": f"tables/{slug}.png" if img else None,
                 "source_file": source_file,
                 "species": species,
             }
             (tables_dir / f"{slug}_meta.json").write_text(
                 json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8"
             )
-            img_note = "  +img" if img else ""
             print(
                 f"  Table {i}: {caption[:80] or '(no caption)'}"
-                f"  [{df.shape[0]}×{df.shape[1]}]  p.{pages}{img_note}  ✓"
+                f"  [{df.shape[0]}×{df.shape[1]}]  p.{pages}  ✓"
             )
             ok += 1
         except Exception as e:
@@ -985,18 +1004,78 @@ def process_pdf(pdf_path: Path, out_dir: Path, quiet: bool = False) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Timeout-safe PDF runner
+# ---------------------------------------------------------------------------
+
+def run_pdf_with_timeout(pdf_path: Path, out_dir: Path, timeout: int) -> tuple[bool, str | None]:
+    """
+    Run process_pdf in a dedicated subprocess with a hard timeout.
+
+    Uses ThreadPoolExecutor (caller) + multiprocessing.Process (here) so that
+    a timed-out or crashed worker can be forcefully terminated via
+    process.terminate() / process.kill() — something ProcessPoolExecutor
+    alone cannot do.
+
+    Returns (success, reason) where reason is None on success or a string
+    describing the failure/timeout.
+    """
+    result_q: mp.Queue = mp.Queue()
+
+    def _target():
+        try:
+            ok = process_pdf(pdf_path, out_dir, quiet=True)
+            result_q.put((ok, None))
+        except Exception as exc:
+            result_q.put((False, str(exc)))
+
+    proc = mp.Process(target=_target, daemon=True)
+    proc.start()
+    proc.join(timeout)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(15)
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+        return False, f"timeout (>{timeout}s)"
+
+    try:
+        success, reason = result_q.get_nowait()
+        return success, reason
+    except Exception:
+        code = proc.exitcode
+        return False, f"process exited with code {code}"
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    INPUT_DIR = Path("/home/artie-sh/repos/spiders/classifier")
-    OUT_BASE  = Path("/home/artie-sh/repos/spiders/classifier_processed")
+    INPUT_DIR = Path(os.environ.get("PDF_INPUT_DIR", "/home/artie-sh/repos/spiders/pardosa"))
+    OUT_BASE  = Path(os.environ.get("PDF_OUT_BASE",  "/home/artie-sh/repos/spiders/pardosa_processed"))
 
     # Number of parallel worker processes.
     # On a GPU instance (e.g. EC2 g5.2xlarge, 1× A10G) keep this at 2–4:
     # Docling shares the GPU for TableFormer, so too many workers will OOM.
     # Override at runtime: WORKERS=2 python3 scripts/pdf_processor.py
     WORKERS = int(os.environ.get("WORKERS", 4))
+
+    # Per-PDF timeout in seconds. PDFs that exceed this are logged as failures
+    # and skipped — the worker slot is freed for the next document.
+    TIMEOUT = int(os.environ.get("TIMEOUT", 3600))  # default: 1 hour
+
+    # SKIP_OCR=1 skips PDFs that would trigger force_full_page_ocr (garbled_ratio
+    # above the threshold). Use this for a fast first pass over the native-text
+    # majority, then re-run without the flag to handle the OCR-heavy minority.
+    SKIP_OCR = os.environ.get("SKIP_OCR", "0") == "1"
+    OCR_THRESHOLD = 0.3
+    # SKIP_IMAGEONLY=1 skips PDFs with virtually no extractable text (scanned /
+    # image-only documents). These are deferred to vision_process.py.
+    SKIP_IMAGEONLY = os.environ.get("SKIP_IMAGEONLY", "1") == "1"
+    IMAGE_ONLY_THRESHOLD = 20  # avg non-ws chars/page below this → image-only
+    MAX_PAGES = int(os.environ.get("MAX_PAGES", 0))  # 0 = no limit
 
     pdf_files = sorted(INPUT_DIR.rglob("*.pdf"))
     if not pdf_files:
@@ -1020,15 +1099,47 @@ if __name__ == "__main__":
     print(f"Real PDFs  : {len(real_pdfs)}")
     print(f"Symlinks   : {len(symlink_pdfs)} (will mirror to output tree after processing)\n")
 
-    # Pre-scan: cheap fitz page count for PDFs still needing processing.
+    # Pre-scan: cheap fitz page count + optional garbled check.
     # PDFs whose output already contains chunks.json are skipped.
+    # With SKIP_OCR=1, PDFs whose garbled_ratio exceeds OCR_THRESHOLD are also
+    # skipped (deferred to a separate OCR pass).
     print("Pre-scanning page counts...", end=" ", flush=True)
+    if SKIP_OCR:
+        print(f"\n  SKIP_OCR=1: deferring PDFs with garbled_ratio > {OCR_THRESHOLD}")
+    if SKIP_IMAGEONLY:
+        print(f"\n  SKIP_IMAGEONLY=1: deferring image-only PDFs (< {IMAGE_ONLY_THRESHOLD} non-ws chars/page)")
     pdf_info: list[tuple[Path, int | None]] = []
+    skipped_ocr = 0
+    skipped_imageonly = 0
     for pdf_path in real_pdfs:
-        if (out_dir_for(pdf_path) / "chunks.json").exists():
-            pdf_info.append((pdf_path, None))   # None → skip
+        out_dir = out_dir_for(pdf_path)
+        if (out_dir / "chunks.json").exists():
+            pdf_info.append((pdf_path, None))   # None → skip (already done)
+        elif out_dir.exists() and not any(out_dir.iterdir()):
+            pass  # empty dir — fall through to process
+        elif out_dir.exists() and not (out_dir / "chunks.json").exists():
+            # Partial output from a failed previous run — clean up and retry
+            shutil.rmtree(out_dir)
+            print(f"  RETRY (cleaned failed output): {pdf_path.name}")
+        elif SKIP_OCR:
+            ratio, n_pages = garbled_ratio(pdf_path)
+            if ratio > OCR_THRESHOLD:
+                skipped_ocr += 1
+                pdf_info.append((pdf_path, None))  # None → skip (deferred)
+            elif SKIP_IMAGEONLY and is_image_only(pdf_path, n_pages, IMAGE_ONLY_THRESHOLD):
+                skipped_imageonly += 1
+                pdf_info.append((pdf_path, None))  # None → skip (deferred to vision)
+            else:
+                pdf_info.append((pdf_path, n_pages))
         else:
-            pdf_info.append((pdf_path, page_count(pdf_path)))
+            n = page_count(pdf_path)
+            if MAX_PAGES and n > MAX_PAGES:
+                pdf_info.append((pdf_path, None))  # None → skip (too large)
+            elif SKIP_IMAGEONLY and is_image_only(pdf_path, n, IMAGE_ONLY_THRESHOLD):
+                skipped_imageonly += 1
+                pdf_info.append((pdf_path, None))  # None → skip (deferred to vision)
+            else:
+                pdf_info.append((pdf_path, n))
 
     to_process  = sum(1 for _, n in pdf_info if n is not None)
     skipped_pre = len(pdf_files) - to_process
@@ -1036,6 +1147,10 @@ if __name__ == "__main__":
     print("done.")
     print(f"To process : {to_process} PDF(s), {total_pages} pages total")
     print(f"Skipping   : {skipped_pre} (chunks.json already present)")
+    if SKIP_OCR:
+        print(f"Deferred   : {skipped_ocr} (force-OCR docs, re-run without SKIP_OCR=1)")
+    if SKIP_IMAGEONLY:
+        print(f"Deferred   : {skipped_imageonly} (image-only docs, run vision_process.py)")
     print(f"Workers    : {WORKERS}\n")
 
     ok = fail = 0
@@ -1047,7 +1162,15 @@ if __name__ == "__main__":
         if n_pages is None:
             tqdm.write(f"SKIP  {pdf_path.parent.name}/{pdf_path.name}")
 
-    pending = [(pdf_path, n) for pdf_path, n in pdf_info if n is not None]
+    # Sort by page count ascending — process small docs first so we make
+    # visible progress quickly and leave large/problematic docs for last.
+    pending = sorted(
+        [(pdf_path, n) for pdf_path, n in pdf_info if n is not None],
+        key=lambda x: x[1],
+    )
+
+    failed_log_path = OUT_BASE / "failed_pdfs.txt"
+    OUT_BASE.mkdir(parents=True, exist_ok=True)
 
     with tqdm(
         total=total_pages,
@@ -1056,27 +1179,29 @@ if __name__ == "__main__":
         dynamic_ncols=True,
         file=sys.stderr,
     ) as pbar:
-        with ProcessPoolExecutor(max_workers=WORKERS) as executor:
+        with ThreadPoolExecutor(max_workers=WORKERS) as executor:
             future_to_info = {
-                executor.submit(process_pdf, pdf_path, out_dir_for(pdf_path), True): (pdf_path, n_pages)
+                executor.submit(run_pdf_with_timeout, pdf_path, out_dir_for(pdf_path), TIMEOUT): (pdf_path, n_pages)
                 for pdf_path, n_pages in pending
             }
 
             for future in as_completed(future_to_info):
                 pdf_path, n_pages = future_to_info[future]
-                elapsed = time.perf_counter() - t_batch_start  # wall time so far
+                elapsed = time.perf_counter() - t_batch_start
 
                 try:
-                    success = future.result()
+                    success, reason = future.result()
                 except Exception as exc:
-                    tqdm.write(f"ERROR  {pdf_path.name}: {exc}")
-                    success = False
+                    success, reason = False, str(exc)
 
-                status = "OK  " if success else "FAIL"
                 if success:
                     ok += 1
+                    status = "OK  "
                 else:
                     fail += 1
+                    status = "FAIL"
+                    with open(failed_log_path, "a", encoding="utf-8") as f:
+                        f.write(f"{pdf_path}\t{n_pages} pg\t{reason or 'process returned False'}\n")
 
                 pages_done += n_pages
                 tqdm.write(f"{status}  {pdf_path.parent.name}/{pdf_path.name}  ({n_pages} pg)")
